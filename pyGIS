@@ -1,0 +1,1640 @@
+# =========================================================
+# FLOOD ESTIMATION - PHASE 1 TOOL (FINAL CORRECTED VERSION)
+# Development of an Automated Geospatial Preprocessing and
+# Parameter Generation Tool for Multi-Criteria Flood
+# Susceptibility Modeling in QGIS
+# =========================================================
+# Version      : 2.0 Final
+# Last Updated : 2026
+# Fixed Bugs   :
+#   1. validate_inputs() - copy paste error in geometry checks
+#   2. reproject_inputs() - missing road/settlement/lake path variables
+#   3. clip_inputs_to_aoi() - variable name mismatch rivers_clip
+#   4. prepare_terrain_parameters() - wrong dict reference clipped_layers
+#   5. prepare_river_distance_parameter() - missing return statement
+#   6. prepare_road_distance_parameter() - missing return statement
+#   7. prepare_settlement_distance_parameter() - wrong key capitalization
+#   8. prepare_lake_distance_parameter() - return in wrong function
+#   9. read_raster_array() - replaced ReadAsArray with ReadRaster
+#      to fix numpy.core.multiarray import error in QGIS 3.34+
+#  10. Function ordering - all helper functions moved above
+#      generate_reclass_summary_excel()
+# =========================================================
+
+# -----------------------------------
+# STANDARD LIBRARIES
+# -----------------------------------
+import os
+import shutil
+import processing
+import numpy as np
+
+# -----------------------------------
+# QGIS CORE
+# -----------------------------------
+from qgis.core import (
+    QgsProcessing,
+    QgsProcessingAlgorithm,
+    QgsProcessingParameterRasterLayer,
+    QgsProcessingParameterVectorLayer,
+    QgsProcessingParameterFolderDestination,
+    QgsProcessingParameterNumber,
+    QgsRasterLayer,
+    QgsVectorLayer,
+    QgsWkbTypes,
+    QgsCoordinateReferenceSystem,
+    QgsProcessingException
+)
+
+# -----------------------------------
+# QT (FOR TOOL LABELS)
+# -----------------------------------
+from qgis.PyQt.QtCore import QCoreApplication
+
+# -----------------------------------
+# GDAL + EXCEL
+# -----------------------------------
+from osgeo import gdal
+from openpyxl import Workbook
+from openpyxl.styles import Font
+
+
+# =========================================================
+# COMMON HELPERS
+# =========================================================
+
+def ensure_folder(path):
+    os.makedirs(path, exist_ok=True)
+    return path
+
+
+def log_layer_summary(name, layer, feedback):
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo(f"{name.upper()} SUMMARY")
+    feedback.pushInfo("=" * 40)
+
+    if not layer or not layer.isValid():
+        feedback.pushInfo("Status: INVALID")
+        return
+
+    feedback.pushInfo("Status: VALID")
+    feedback.pushInfo(f"CRS: {layer.crs().authid()}")
+
+    if isinstance(layer, QgsRasterLayer):
+        feedback.pushInfo("Type: Raster")
+        feedback.pushInfo(f"Width: {layer.width()}")
+        feedback.pushInfo(f"Height: {layer.height()}")
+        feedback.pushInfo(f"Bands: {layer.bandCount()}")
+        feedback.pushInfo(f"Extent: {layer.extent().toString()}")
+
+    elif isinstance(layer, QgsVectorLayer):
+        feedback.pushInfo("Type: Vector")
+        feedback.pushInfo(f"Feature Count: {layer.featureCount()}")
+        feedback.pushInfo(f"Geometry Type: {QgsWkbTypes.displayString(layer.wkbType())}")
+        feedback.pushInfo(f"Extent: {layer.extent().toString()}")
+
+
+# =========================================================
+# VALIDATION
+# =========================================================
+
+def validate_raster_layer(layer, name):
+    if not layer or not layer.isValid():
+        raise QgsProcessingException(
+            f"{name} layer is invalid or could not be loaded."
+        )
+    if layer.bandCount() < 1:
+        raise QgsProcessingException(
+            f"{name} raster has no bands."
+        )
+    return layer
+
+
+def validate_vector_layer(layer, name, expected_geom_types=None):
+    if not layer or not layer.isValid():
+        raise QgsProcessingException(
+            f"{name} layer is invalid or could not be loaded."
+        )
+    if layer.featureCount() == 0:
+        raise QgsProcessingException(
+            f"{name} layer has no features."
+        )
+    geom_type = layer.geometryType()
+    if expected_geom_types is not None and geom_type not in expected_geom_types:
+        raise QgsProcessingException(
+            f"{name} has invalid geometry type. "
+            f"Found: {QgsWkbTypes.displayString(layer.wkbType())}"
+        )
+    return layer
+
+
+def check_geometry_validity(layer, layer_name, feedback):
+    invalid_count = 0
+    empty_count   = 0
+
+    for feat in layer.getFeatures():
+        geom = feat.geometry()
+        if geom is None or geom.isEmpty():
+            empty_count   += 1
+            invalid_count += 1
+            continue
+        if not geom.isGeosValid():
+            invalid_count += 1
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo(f"{layer_name.upper()} GEOMETRY CHECK")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo(f"Empty features:   {empty_count}")
+    feedback.pushInfo(f"Invalid features: {invalid_count}")
+
+    if invalid_count > 0:
+        raise QgsProcessingException(
+            f"{layer_name} contains {invalid_count} invalid/empty geometries. "
+            f"Fix before running the tool."
+        )
+
+
+def validate_inputs(dem_layer, aoi_layer, rainfall_layer, lulc_layer,
+                    river_layer, road_layer, settlement_layer, lake_layer,
+                    feedback):
+
+    # --- Raster Validation ---
+    dem_layer       = validate_raster_layer(dem_layer,      "DEM")
+    rainfall_layer  = validate_raster_layer(rainfall_layer, "Rainfall")
+    lulc_layer      = validate_raster_layer(lulc_layer,     "LULC")
+
+    # --- Vector Validation ---
+    aoi_layer = validate_vector_layer(
+        aoi_layer, "AOI",
+        expected_geom_types=[QgsWkbTypes.PolygonGeometry]
+    )
+    river_layer = validate_vector_layer(
+        river_layer, "Rivers",
+        expected_geom_types=[QgsWkbTypes.LineGeometry]
+    )
+    road_layer = validate_vector_layer(
+        road_layer, "Roads",
+        expected_geom_types=[QgsWkbTypes.LineGeometry]
+    )
+    settlement_layer = validate_vector_layer(
+        settlement_layer, "Settlements",
+        expected_geom_types=[QgsWkbTypes.PolygonGeometry]
+    )
+    lake_layer = validate_vector_layer(
+        lake_layer, "Lakes",
+        expected_geom_types=[QgsWkbTypes.PointGeometry]
+    )
+
+    # --- Geometry Validity Checks ---
+    # FIX 1: Each layer now correctly passed — original code passed
+    #         river_layer for all four checks (copy-paste bug)
+    check_geometry_validity(aoi_layer,        "AOI",         feedback)
+    check_geometry_validity(river_layer,      "Rivers",      feedback)
+    check_geometry_validity(road_layer,       "Roads",       feedback)
+    check_geometry_validity(settlement_layer, "Settlements", feedback)
+    check_geometry_validity(lake_layer,       "Lakes",       feedback)
+
+    # --- Layer Summary Logging ---
+    log_layer_summary("DEM",         dem_layer,        feedback)
+    log_layer_summary("AOI",         aoi_layer,        feedback)
+    log_layer_summary("Rainfall",    rainfall_layer,   feedback)
+    log_layer_summary("LULC",        lulc_layer,       feedback)
+    log_layer_summary("Rivers",      river_layer,      feedback)
+    log_layer_summary("Roads",       road_layer,       feedback)
+    log_layer_summary("Settlements", settlement_layer, feedback)
+    log_layer_summary("Lakes",       lake_layer,       feedback)
+
+    feedback.pushInfo("")
+    feedback.pushInfo("All input layers passed validation.")
+
+    return {
+        "DEM":         dem_layer,
+        "AOI":         aoi_layer,
+        "Rainfall":    rainfall_layer,
+        "LULC":        lulc_layer,
+        "Rivers":      river_layer,
+        "Roads":       road_layer,
+        "Settlements": settlement_layer,
+        "Lakes":       lake_layer
+    }
+
+
+# =========================================================
+# REPROJECTION
+# =========================================================
+
+def reproject_vector_layer(input_layer, target_crs, output_path,
+                            layer_name, feedback):
+    feedback.pushInfo(f"Reprojecting vector layer: {layer_name}")
+
+    result = processing.run(
+        "native:reprojectlayer",
+        {
+            'INPUT':      input_layer,
+            'TARGET_CRS': target_crs,
+            'OUTPUT':     output_path
+        }
+    )
+    output = result['OUTPUT']
+
+    if not os.path.exists(output):
+        raise QgsProcessingException(
+            f"Failed to reproject vector layer: {layer_name}"
+        )
+
+    feedback.pushInfo(f"{layer_name} reprojected: {output}")
+    return output
+
+
+def reproject_raster_layer(input_layer, target_crs, output_path,
+                            layer_name, resampling_method, feedback):
+    feedback.pushInfo(f"Reprojecting raster layer: {layer_name}")
+
+    result = processing.run(
+        "gdal:warpreproject",
+        {
+            'INPUT':             input_layer,
+            'SOURCE_CRS':        None,
+            'TARGET_CRS':        target_crs,
+            'RESAMPLING':        resampling_method,
+            'NODATA':            None,
+            'TARGET_RESOLUTION': None,
+            'OPTIONS':           '',
+            'DATA_TYPE':         0,
+            'TARGET_EXTENT':     None,
+            'TARGET_EXTENT_CRS': None,
+            'MULTITHREADING':    False,
+            'EXTRA':             '',
+            'OUTPUT':            output_path
+        }
+    )
+    output = result['OUTPUT']
+
+    if not os.path.exists(output):
+        raise QgsProcessingException(
+            f"Failed to reproject raster layer: {layer_name}"
+        )
+
+    feedback.pushInfo(f"{layer_name} reprojected: {output}")
+    return output
+
+
+def reproject_inputs(validated_layers, target_crs, workspace, feedback):
+    reprojected_folder = ensure_folder(
+        os.path.join(workspace, "02_reprojected")
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("STEP: REPROJECTION")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo(f"Target CRS: {target_crs.authid()}")
+
+    crs_code = target_crs.authid().replace("EPSG:", "")
+
+    # FIX 2: Added missing road_reproj, settlement_reproj, lake_reproj
+    aoi_reproj        = os.path.join(reprojected_folder, f"AOI_{crs_code}.gpkg")
+    river_reproj      = os.path.join(reprojected_folder, f"Rivers_{crs_code}.gpkg")
+    road_reproj       = os.path.join(reprojected_folder, f"Roads_{crs_code}.gpkg")
+    settlement_reproj = os.path.join(reprojected_folder, f"Settlements_{crs_code}.gpkg")
+    lake_reproj       = os.path.join(reprojected_folder, f"Lakes_{crs_code}.gpkg")
+    dem_reproj        = os.path.join(reprojected_folder, f"DEM_{crs_code}.tif")
+    rainfall_reproj   = os.path.join(reprojected_folder, f"Rainfall_{crs_code}.tif")
+    lulc_reproj       = os.path.join(reprojected_folder, f"LULC_{crs_code}.tif")
+
+    # --- Vector Reprojection ---
+    aoi_out = reproject_vector_layer(
+        validated_layers["AOI"], target_crs, aoi_reproj, "AOI", feedback
+    )
+    river_out = reproject_vector_layer(
+        validated_layers["Rivers"], target_crs, river_reproj, "Rivers", feedback
+    )
+    road_out = reproject_vector_layer(
+        validated_layers["Roads"], target_crs, road_reproj, "Roads", feedback
+    )
+    settlement_out = reproject_vector_layer(
+        validated_layers["Settlements"], target_crs,
+        settlement_reproj, "Settlements", feedback
+    )
+    lake_out = reproject_vector_layer(
+        validated_layers["Lakes"], target_crs, lake_reproj, "Lakes", feedback
+    )
+
+    # --- Raster Reprojection ---
+    # 0 = Nearest Neighbour, 1 = Bilinear
+    dem_out = reproject_raster_layer(
+        validated_layers["DEM"], target_crs, dem_reproj, "DEM", 0, feedback
+    )
+    rainfall_out = reproject_raster_layer(
+        validated_layers["Rainfall"], target_crs,
+        rainfall_reproj, "Rainfall", 1, feedback
+    )
+    lulc_out = reproject_raster_layer(
+        validated_layers["LULC"], target_crs, lulc_reproj, "LULC", 0, feedback
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("All layers reprojected successfully.")
+
+    return {
+        "AOI":         aoi_out,
+        "Rivers":      river_out,
+        "Roads":       road_out,
+        "Settlements": settlement_out,
+        "Lakes":       lake_out,
+        "DEM":         dem_out,
+        "Rainfall":    rainfall_out,
+        "LULC":        lulc_out
+    }
+
+
+# =========================================================
+# CLIP TO AOI
+# =========================================================
+
+def clip_raster_by_aoi(input_raster, aoi_layer, output_path,
+                        layer_name, feedback):
+    feedback.pushInfo(f"Clipping raster: {layer_name}")
+
+    result = processing.run(
+        "gdal:cliprasterbymasklayer",
+        {
+            'INPUT':           input_raster,
+            'MASK':            aoi_layer,
+            'SOURCE_CRS':      None,
+            'TARGET_CRS':      None,
+            'NODATA':          None,
+            'ALPHA_BAND':      False,
+            'CROP_TO_CUTLINE': True,
+            'KEEP_RESOLUTION': True,
+            'SET_RESOLUTION':  False,
+            'X_RESOLUTION':    None,
+            'Y_RESOLUTION':    None,
+            'MULTITHREADING':  False,
+            'OPTIONS':         '',
+            'DATA_TYPE':       0,
+            'EXTRA':           '',
+            'OUTPUT':          output_path
+        }
+    )
+    output = result['OUTPUT']
+
+    if not os.path.exists(output):
+        raise QgsProcessingException(f"Failed to clip raster: {layer_name}")
+
+    feedback.pushInfo(f"{layer_name} clipped: {output}")
+    return output
+
+
+def clip_vector_by_aoi(input_vector, aoi_layer, output_path,
+                        layer_name, feedback):
+    feedback.pushInfo(f"Clipping vector: {layer_name}")
+
+    result = processing.run(
+        "native:clip",
+        {
+            'INPUT':   input_vector,
+            'OVERLAY': aoi_layer,
+            'OUTPUT':  output_path
+        }
+    )
+    output = result['OUTPUT']
+
+    if not os.path.exists(output):
+        raise QgsProcessingException(f"Failed to clip vector: {layer_name}")
+
+    feedback.pushInfo(f"{layer_name} clipped: {output}")
+    return output
+
+
+def clip_inputs_to_aoi(reprojected_layers, workspace, feedback):
+    clipped_folder = ensure_folder(os.path.join(workspace, "03_clipped"))
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("STEP: CLIP TO AOI")
+    feedback.pushInfo("=" * 40)
+
+    aoi_path = reprojected_layers["AOI"]
+
+    dem_clip        = os.path.join(clipped_folder, "DEM_clip.tif")
+    rainfall_clip   = os.path.join(clipped_folder, "Rainfall_clip.tif")
+    lulc_clip       = os.path.join(clipped_folder, "LULC_clip.tif")
+    river_clip      = os.path.join(clipped_folder, "Rivers_clip.gpkg")
+    road_clip       = os.path.join(clipped_folder, "Roads_clip.gpkg")
+    settlement_clip = os.path.join(clipped_folder, "Settlements_clip.gpkg")
+    lake_clip       = os.path.join(clipped_folder, "Lakes_clip.gpkg")
+
+    # --- Raster Clipping ---
+    dem_out = clip_raster_by_aoi(
+        reprojected_layers["DEM"], aoi_path, dem_clip, "DEM", feedback
+    )
+    rainfall_out = clip_raster_by_aoi(
+        reprojected_layers["Rainfall"], aoi_path,
+        rainfall_clip, "Rainfall", feedback
+    )
+    lulc_out = clip_raster_by_aoi(
+        reprojected_layers["LULC"], aoi_path, lulc_clip, "LULC", feedback
+    )
+
+    # --- Vector Clipping ---
+    # FIX 3: Changed rivers_clip to river_clip (variable name mismatch)
+    river_out = clip_vector_by_aoi(
+        reprojected_layers["Rivers"], aoi_path, river_clip, "Rivers", feedback
+    )
+    road_out = clip_vector_by_aoi(
+        reprojected_layers["Roads"], aoi_path, road_clip, "Roads", feedback
+    )
+    settlement_out = clip_vector_by_aoi(
+        reprojected_layers["Settlements"], aoi_path,
+        settlement_clip, "Settlements", feedback
+    )
+    lake_out = clip_vector_by_aoi(
+        reprojected_layers["Lakes"], aoi_path, lake_clip, "Lakes", feedback
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("All layers clipped to AOI successfully.")
+
+    return {
+        "AOI":         aoi_path,
+        "DEM":         dem_out,
+        "Rainfall":    rainfall_out,
+        "LULC":        lulc_out,
+        "Rivers":      river_out,
+        "Roads":       road_out,
+        "Settlements": settlement_out,
+        "Lakes":       lake_out
+    }
+
+
+# =========================================================
+# MODEL INPUT PREPARATION
+# =========================================================
+
+def get_raster_grid_info(raster_path, layer_name, feedback):
+    raster_layer = QgsRasterLayer(raster_path, layer_name)
+
+    if not raster_layer.isValid():
+        raise QgsProcessingException(
+            f"{layer_name} reference raster is invalid: {raster_path}"
+        )
+
+    extent = raster_layer.extent()
+    xmin   = extent.xMinimum()
+    xmax   = extent.xMaximum()
+    ymin   = extent.yMinimum()
+    ymax   = extent.yMaximum()
+
+    width  = raster_layer.width()
+    height = raster_layer.height()
+
+    xres = (xmax - xmin) / width
+    yres = (ymax - ymin) / height
+
+    extent_string = f"{xmin},{xmax},{ymin},{ymax}"
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("DEM REFERENCE GRID")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo(f"CRS:         {raster_layer.crs().authid()}")
+    feedback.pushInfo(f"Width:       {width}")
+    feedback.pushInfo(f"Height:      {height}")
+    feedback.pushInfo(f"Pixel Size X:{xres}")
+    feedback.pushInfo(f"Pixel Size Y:{yres}")
+    feedback.pushInfo(f"Extent:      {extent_string}")
+
+    return {
+        "layer":         raster_layer,
+        "crs":           raster_layer.crs(),
+        "width":         width,
+        "height":        height,
+        "xres":          xres,
+        "yres":          yres,
+        "extent_string": extent_string
+    }
+
+
+def align_raster_to_reference(input_raster, ref_info, output_path,
+                               layer_name, resampling_method, feedback):
+    feedback.pushInfo(f"Aligning raster to DEM grid: {layer_name}")
+
+    result = processing.run(
+        "gdal:warpreproject",
+        {
+            'INPUT':             input_raster,
+            'SOURCE_CRS':        None,
+            'TARGET_CRS':        ref_info["crs"],
+            'RESAMPLING':        resampling_method,
+            'NODATA':            None,
+            'TARGET_RESOLUTION': ref_info["xres"],
+            'OPTIONS':           '',
+            'DATA_TYPE':         0,
+            'TARGET_EXTENT':     ref_info["extent_string"],
+            'TARGET_EXTENT_CRS': ref_info["crs"],
+            'MULTITHREADING':    False,
+            'EXTRA':             '',
+            'OUTPUT':            output_path
+        }
+    )
+    output = result['OUTPUT']
+
+    if not os.path.exists(output):
+        raise QgsProcessingException(f"Failed to align raster: {layer_name}")
+
+    feedback.pushInfo(f"{layer_name} aligned: {output}")
+    return output
+
+
+def prepare_model_input_rasters(clipped_layers, workspace, feedback):
+    model_input_folder = ensure_folder(
+        os.path.join(workspace, "04_model_input")
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("STEP: PREPARE MODEL INPUT RASTERS")
+    feedback.pushInfo("=" * 40)
+
+    dem_path      = clipped_layers["DEM"]
+    rainfall_path = clipped_layers["Rainfall"]
+    lulc_path     = clipped_layers["LULC"]
+
+    elevation_out = os.path.join(model_input_folder, "Elevation.tif")
+    rainfall_out  = os.path.join(model_input_folder, "Rainfall.tif")
+    lulc_out      = os.path.join(model_input_folder, "LULC.tif")
+
+    ref_info = get_raster_grid_info(dem_path, "DEM_clip", feedback)
+
+    shutil.copy(dem_path, elevation_out)
+    feedback.pushInfo(f"Elevation saved: {elevation_out}")
+
+    rainfall_aligned = align_raster_to_reference(
+        rainfall_path, ref_info, rainfall_out, "Rainfall", 1, feedback
+    )
+    lulc_aligned = align_raster_to_reference(
+        lulc_path, ref_info, lulc_out, "LULC", 0, feedback
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("Model input rasters prepared successfully.")
+
+    return {
+        "Elevation":   elevation_out,
+        "Rainfall":    rainfall_aligned,
+        "LULC":        lulc_aligned,
+        "DEM_REF":     dem_path,
+        "REF_INFO":    ref_info,
+        "AOI":         clipped_layers["AOI"],
+        "Rivers":      clipped_layers["Rivers"],
+        "Roads":       clipped_layers["Roads"],
+        "Settlements": clipped_layers["Settlements"],
+        "Lakes":       clipped_layers["Lakes"]
+    }
+
+
+# =========================================================
+# TERRAIN PARAMETERS
+# =========================================================
+
+def generate_slope(dem_path, output_path, feedback):
+    feedback.pushInfo("Generating slope raster...")
+
+    result = processing.run(
+        "gdal:slope",
+        {
+            'INPUT':         dem_path,
+            'BAND':          1,
+            'SCALE':         1,
+            'AS_PERCENT':    False,
+            'COMPUTE_EDGES': False,
+            'ZEVENBERGEN':   False,
+            'OPTIONS':       '',
+            'EXTRA':         '',
+            'OUTPUT':        output_path
+        }
+    )
+    output = result['OUTPUT']
+
+    if not os.path.exists(output):
+        raise QgsProcessingException("Failed to generate slope raster.")
+
+    feedback.pushInfo(f"Slope generated: {output}")
+    return output
+
+
+def generate_flow_products(dem_path, flow_acc_out, flow_dir_out,
+                           threshold, memory_mb, feedback):
+    feedback.pushInfo(
+        "Generating flow accumulation and flow direction "
+        "using GRASS r.watershed..."
+    )
+
+    try:
+        result = processing.run(
+            "grass7:r.watershed",
+            {
+                'elevation':                       dem_path,
+                'depression':                      None,
+                'flow':                            None,
+                'disturbed_land':                  None,
+                'blocking':                        None,
+                'threshold':                       threshold,
+                'memory':                          memory_mb,
+                '-s':                              False,
+                '-4':                              False,
+                '-m':                              False,
+                'accumulation':                    flow_acc_out,
+                'drainage':                        flow_dir_out,
+                'basin':                           'TEMPORARY_OUTPUT',
+                'stream':                          'TEMPORARY_OUTPUT',
+                'half_basin':                      'TEMPORARY_OUTPUT',
+                'length_slope':                    'TEMPORARY_OUTPUT',
+                'slope_steepness':                 'TEMPORARY_OUTPUT',
+                'tci':                             'TEMPORARY_OUTPUT',
+                'spi':                             'TEMPORARY_OUTPUT',
+                'GRASS_REGION_PARAMETER':          None,
+                'GRASS_REGION_CELLSIZE_PARAMETER': 0,
+                'GRASS_RASTER_FORMAT_OPT':         '',
+                'GRASS_RASTER_FORMAT_META':        ''
+            }
+        )
+    except Exception as e:
+        raise QgsProcessingException(
+            f"GRASS watershed processing failed. "
+            f"Ensure GRASS provider is enabled in QGIS. "
+            f"Details: {str(e)}"
+        )
+
+    if not os.path.exists(flow_acc_out):
+        raise QgsProcessingException(
+            "Flow accumulation output was not created."
+        )
+    if not os.path.exists(flow_dir_out):
+        raise QgsProcessingException(
+            "Flow direction output was not created."
+        )
+
+    feedback.pushInfo(f"Flow accumulation saved: {flow_acc_out}")
+    feedback.pushInfo(f"Flow direction saved:    {flow_dir_out}")
+
+    return {
+        "FlowAccumulation": flow_acc_out,
+        "FlowDirection":    flow_dir_out
+    }
+
+
+def prepare_terrain_parameters(model_inputs, workspace,
+                                flow_threshold, grass_memory_mb, feedback):
+    parameter_folder = ensure_folder(
+        os.path.join(workspace, "05_parameters")
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("STEP: PREPARE TERRAIN PARAMETERS")
+    feedback.pushInfo("=" * 40)
+
+    elevation_path = model_inputs["Elevation"]
+
+    slope_out    = os.path.join(parameter_folder, "Slope.tif")
+    flow_acc_out = os.path.join(parameter_folder, "FlowAccumulation.tif")
+    flow_dir_out = os.path.join(parameter_folder, "FlowDirection.tif")
+
+    slope_path   = generate_slope(elevation_path, slope_out, feedback)
+
+    flow_outputs = generate_flow_products(
+        elevation_path,
+        flow_acc_out,
+        flow_dir_out,
+        flow_threshold,
+        grass_memory_mb,
+        feedback
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("Terrain parameters prepared successfully.")
+
+    # FIX 4: Replaced clipped_layers with model_inputs
+    return {
+        "Elevation":        elevation_path,
+        "Rainfall":         model_inputs["Rainfall"],
+        "LULC":             model_inputs["LULC"],
+        "Slope":            slope_path,
+        "FlowAccumulation": flow_outputs["FlowAccumulation"],
+        "FlowDirection":    flow_outputs["FlowDirection"],
+        "AOI":              model_inputs["AOI"],
+        "Rivers":           model_inputs["Rivers"],
+        "Roads":            model_inputs["Roads"],
+        "Settlements":      model_inputs["Settlements"],
+        "Lakes":            model_inputs["Lakes"],
+        "DEM_REF":          model_inputs["DEM_REF"],
+        "REF_INFO":         model_inputs["REF_INFO"]
+    }
+
+
+# =========================================================
+# RASTERIZATION AND PROXIMITY HELPERS
+# =========================================================
+
+def rasterize_vector_to_dem_grid(vector_path, dem_path, output_path,
+                                  layer_name, feedback):
+    """
+    Generic rasterization aligned to DEM grid.
+    Replaces four separate rasterize functions.
+    """
+    dem_layer = QgsRasterLayer(dem_path, "DEM_REF")
+
+    if not dem_layer.isValid():
+        raise QgsProcessingException(
+            f"DEM reference raster could not be loaded "
+            f"for {layer_name} rasterization."
+        )
+
+    pixel_size_x = dem_layer.rasterUnitsPerPixelX()
+    pixel_size_y = dem_layer.rasterUnitsPerPixelY()
+
+    feedback.pushInfo(f"Rasterizing {layer_name}...")
+    feedback.pushInfo(f"DEM Cell Size X: {pixel_size_x}")
+    feedback.pushInfo(f"DEM Cell Size Y: {pixel_size_y}")
+
+    result = processing.run(
+        "gdal:rasterize",
+        {
+            'INPUT':     vector_path,
+            'FIELD':     None,
+            'BURN':      1,
+            'USE_Z':     False,
+            'UNITS':     1,
+            'WIDTH':     pixel_size_x,
+            'HEIGHT':    pixel_size_y,
+            'EXTENT':    dem_path,
+            'NODATA':    0,
+            'OPTIONS':   '',
+            'DATA_TYPE': 5,
+            'INIT':      0,
+            'INVERT':    False,
+            'EXTRA':     '',
+            'OUTPUT':    output_path
+        }
+    )
+    output = result['OUTPUT']
+
+    if not os.path.exists(output):
+        raise QgsProcessingException(f"Failed to rasterize {layer_name}.")
+
+    feedback.pushInfo(f"{layer_name} raster generated: {output}")
+    return output
+
+
+def generate_proximity_raster(input_raster, output_path,
+                               layer_name, feedback):
+    """
+    Generic GDAL proximity raster generation.
+    Replaces four separate proximity functions.
+    """
+    feedback.pushInfo(f"Generating distance-to-{layer_name} raster...")
+
+    result = processing.run(
+        "gdal:proximity",
+        {
+            'INPUT':        input_raster,
+            'BAND':         1,
+            'VALUES':       '1',
+            'UNITS':        0,
+            'MAX_DISTANCE': None,
+            'REPLACE':      0,
+            'NODATA':       0,
+            'OPTIONS':      '',
+            'EXTRA':        '',
+            'DATA_TYPE':    5,
+            'OUTPUT':       output_path
+        }
+    )
+    output = result['OUTPUT']
+
+    if not os.path.exists(output):
+        raise QgsProcessingException(
+            f"Failed to generate distance-to-{layer_name} raster."
+        )
+
+    feedback.pushInfo(f"Distance-to-{layer_name} raster generated: {output}")
+    return output
+
+
+# =========================================================
+# PROXIMITY PARAMETERS
+# =========================================================
+
+def prepare_river_distance_parameter(terrain_parameters, workspace, feedback):
+    parameter_folder = ensure_folder(
+        os.path.join(workspace, "05_parameters")
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("STEP: PREPARE RIVER DISTANCE PARAMETER")
+    feedback.pushInfo("=" * 40)
+
+    river_vector = terrain_parameters["Rivers"]
+    dem_ref      = terrain_parameters["DEM_REF"]
+
+    river_raster_out = os.path.join(parameter_folder, "RiverRaster.tif")
+    dist_river_out   = os.path.join(parameter_folder, "DistanceToRiver.tif")
+
+    river_raster = rasterize_vector_to_dem_grid(
+        river_vector, dem_ref, river_raster_out, "Rivers", feedback
+    )
+    dist_river = generate_proximity_raster(
+        river_raster, dist_river_out, "River", feedback
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("River distance parameter prepared successfully.")
+
+    # FIX 5: Added missing return statement
+    return {
+        "Elevation":        terrain_parameters["Elevation"],
+        "Rainfall":         terrain_parameters["Rainfall"],
+        "LULC":             terrain_parameters["LULC"],
+        "Slope":            terrain_parameters["Slope"],
+        "FlowAccumulation": terrain_parameters["FlowAccumulation"],
+        "FlowDirection":    terrain_parameters["FlowDirection"],
+        "RiverRaster":      river_raster,
+        "DistanceToRiver":  dist_river,
+        "AOI":              terrain_parameters["AOI"],
+        "Rivers":           river_vector,
+        "Roads":            terrain_parameters["Roads"],
+        "Settlements":      terrain_parameters["Settlements"],
+        "Lakes":            terrain_parameters["Lakes"],
+        "DEM_REF":          dem_ref,
+        "REF_INFO":         terrain_parameters["REF_INFO"]
+    }
+
+
+def prepare_road_distance_parameter(river_parameters, workspace, feedback):
+    parameter_folder = ensure_folder(
+        os.path.join(workspace, "05_parameters")
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("STEP: PREPARE ROAD DISTANCE PARAMETER")
+    feedback.pushInfo("=" * 40)
+
+    road_vector = river_parameters["Roads"]
+    dem_ref     = river_parameters["DEM_REF"]
+
+    road_raster_out = os.path.join(parameter_folder, "RoadRaster.tif")
+    dist_road_out   = os.path.join(parameter_folder, "DistanceToRoad.tif")
+
+    road_raster = rasterize_vector_to_dem_grid(
+        road_vector, dem_ref, road_raster_out, "Roads", feedback
+    )
+    dist_road = generate_proximity_raster(
+        road_raster, dist_road_out, "Road", feedback
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("Road distance parameter prepared successfully.")
+
+    # FIX 6: Added missing return statement
+    return {
+        "Elevation":        river_parameters["Elevation"],
+        "Rainfall":         river_parameters["Rainfall"],
+        "LULC":             river_parameters["LULC"],
+        "Slope":            river_parameters["Slope"],
+        "FlowAccumulation": river_parameters["FlowAccumulation"],
+        "FlowDirection":    river_parameters["FlowDirection"],
+        "RiverRaster":      river_parameters["RiverRaster"],
+        "DistanceToRiver":  river_parameters["DistanceToRiver"],
+        "RoadRaster":       road_raster,
+        "DistanceToRoad":   dist_road,
+        "AOI":              river_parameters["AOI"],
+        "Rivers":           river_parameters["Rivers"],
+        "Roads":            road_vector,
+        "Settlements":      river_parameters["Settlements"],
+        "Lakes":            river_parameters["Lakes"],
+        "DEM_REF":          dem_ref,
+        "REF_INFO":         river_parameters["REF_INFO"]
+    }
+
+
+def prepare_settlement_distance_parameter(road_parameters, workspace, feedback):
+    parameter_folder = ensure_folder(
+        os.path.join(workspace, "05_parameters")
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("STEP: PREPARE SETTLEMENT DISTANCE PARAMETER")
+    feedback.pushInfo("=" * 40)
+
+    # FIX 7: Changed terrain_parameters["settlements"] to
+    #         road_parameters["Settlements"] (correct dict + capitalization)
+    settlement_vector = road_parameters["Settlements"]
+    dem_ref           = road_parameters["DEM_REF"]
+
+    settlement_raster_out = os.path.join(
+        parameter_folder, "SettlementRaster.tif"
+    )
+    dist_settlement_out = os.path.join(
+        parameter_folder, "DistanceToSettlement.tif"
+    )
+
+    settlement_raster = rasterize_vector_to_dem_grid(
+        settlement_vector, dem_ref,
+        settlement_raster_out, "Settlements", feedback
+    )
+    dist_settlement = generate_proximity_raster(
+        settlement_raster, dist_settlement_out, "Settlement", feedback
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("Settlement distance parameter prepared successfully.")
+
+    # FIX 7 continued: Added missing return statement
+    return {
+        "Elevation":            road_parameters["Elevation"],
+        "Rainfall":             road_parameters["Rainfall"],
+        "LULC":                 road_parameters["LULC"],
+        "Slope":                road_parameters["Slope"],
+        "FlowAccumulation":     road_parameters["FlowAccumulation"],
+        "FlowDirection":        road_parameters["FlowDirection"],
+        "RiverRaster":          road_parameters["RiverRaster"],
+        "DistanceToRiver":      road_parameters["DistanceToRiver"],
+        "RoadRaster":           road_parameters["RoadRaster"],
+        "DistanceToRoad":       road_parameters["DistanceToRoad"],
+        "SettlementRaster":     settlement_raster,
+        "DistanceToSettlement": dist_settlement,
+        "AOI":                  road_parameters["AOI"],
+        "Rivers":               road_parameters["Rivers"],
+        "Roads":                road_parameters["Roads"],
+        "Settlements":          settlement_vector,
+        "Lakes":                road_parameters["Lakes"],
+        "DEM_REF":              dem_ref,
+        "REF_INFO":             road_parameters["REF_INFO"]
+    }
+
+
+def prepare_lake_distance_parameter(settlement_parameters, workspace, feedback):
+    parameter_folder = ensure_folder(
+        os.path.join(workspace, "05_parameters")
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("STEP: PREPARE LAKE DISTANCE PARAMETER")
+    feedback.pushInfo("=" * 40)
+
+    # FIX 8: Using correct input dictionary settlement_parameters
+    lake_vector = settlement_parameters["Lakes"]
+    dem_ref     = settlement_parameters["DEM_REF"]
+
+    lake_raster_out = os.path.join(parameter_folder, "LakeRaster.tif")
+    dist_lake_out   = os.path.join(parameter_folder, "DistanceToLake.tif")
+
+    lake_raster = rasterize_vector_to_dem_grid(
+        lake_vector, dem_ref, lake_raster_out, "Lakes", feedback
+    )
+    dist_lake = generate_proximity_raster(
+        lake_raster, dist_lake_out, "Lake", feedback
+    )
+
+    feedback.pushInfo("")
+    feedback.pushInfo("Lake distance parameter prepared successfully.")
+
+    return {
+        "Elevation":            settlement_parameters["Elevation"],
+        "Rainfall":             settlement_parameters["Rainfall"],
+        "LULC":                 settlement_parameters["LULC"],
+        "Slope":                settlement_parameters["Slope"],
+        "FlowAccumulation":     settlement_parameters["FlowAccumulation"],
+        "FlowDirection":        settlement_parameters["FlowDirection"],
+        "RiverRaster":          settlement_parameters["RiverRaster"],
+        "DistanceToRiver":      settlement_parameters["DistanceToRiver"],
+        "RoadRaster":           settlement_parameters["RoadRaster"],
+        "DistanceToRoad":       settlement_parameters["DistanceToRoad"],
+        "SettlementRaster":     settlement_parameters["SettlementRaster"],
+        "DistanceToSettlement": settlement_parameters["DistanceToSettlement"],
+        "LakeRaster":           lake_raster,
+        "DistanceToLake":       dist_lake,
+        "AOI":                  settlement_parameters["AOI"],
+        "Rivers":               settlement_parameters["Rivers"],
+        "Roads":                settlement_parameters["Roads"],
+        "Settlements":          settlement_parameters["Settlements"],
+        "Lakes":                lake_vector,
+        "DEM_REF":              dem_ref,
+        "REF_INFO":             settlement_parameters["REF_INFO"]
+    }
+
+
+# =========================================================
+# RASTER STATISTICS HELPERS
+# =========================================================
+# NOTE: These four functions MUST appear before
+#       generate_reclass_summary_excel()
+# FIX 10: Correct function ordering applied here
+
+def read_raster_array(raster_path):
+    """
+    Read raster band as numpy array WITHOUT using gdal_array.
+    FIX 9: Replaced band.ReadAsArray() with band.ReadRaster()
+    to avoid numpy.core.multiarray ImportError in QGIS 3.34+
+    """
+    ds = gdal.Open(raster_path)
+    if ds is None:
+        raise QgsProcessingException(
+            f"Could not open raster: {raster_path}"
+        )
+
+    band   = ds.GetRasterBand(1)
+    cols   = ds.RasterXSize
+    rows   = ds.RasterYSize
+    nodata = band.GetNoDataValue()
+
+    # Map GDAL data types to numpy dtype strings
+    # Avoids gdal_array module entirely
+    gdal_numpy_type = {
+        1:  'uint8',     # GDT_Byte
+        2:  'uint16',    # GDT_UInt16
+        3:  'int16',     # GDT_Int16
+        4:  'uint32',    # GDT_UInt32
+        5:  'int32',     # GDT_Int32
+        6:  'float32',   # GDT_Float32
+        7:  'float64',   # GDT_Float64
+        8:  'complex64', # GDT_CInt16
+        9:  'complex64', # GDT_CInt32
+        10: 'complex64', # GDT_CFloat32
+        11: 'complex128' # GDT_CFloat64
+    }
+
+    data_type  = band.DataType
+    numpy_type = gdal_numpy_type.get(data_type, 'float32')
+
+    # Read raw buffer directly — no gdal_array needed
+    raw_data = band.ReadRaster(
+        xoff=0,       yoff=0,
+        xsize=cols,   ysize=rows,
+        buf_xsize=cols, buf_ysize=rows,
+        buf_type=band.DataType
+    )
+
+    # Convert buffer to numpy array safely
+    arr = np.frombuffer(raw_data, dtype=numpy_type) \
+            .reshape(rows, cols) \
+            .astype('float64')
+
+    # Mask nodata values
+    if nodata is not None:
+        arr[arr == nodata] = np.nan
+
+    # Mask any remaining invalid values
+    arr[~np.isfinite(arr)] = np.nan
+
+    return arr, ds, nodata
+
+
+def raster_summary(arr):
+    valid = arr[~np.isnan(arr)]
+    if valid.size == 0:
+        return None
+
+    return {
+        "count_valid": int(valid.size),
+        "min":  float(np.min(valid)),
+        "max":  float(np.max(valid)),
+        "mean": float(np.mean(valid)),
+        "std":  float(np.std(valid)),
+        "q0":   float(np.percentile(valid, 0)),
+        "q10":  float(np.percentile(valid, 10)),
+        "q20":  float(np.percentile(valid, 20)),
+        "q25":  float(np.percentile(valid, 25)),
+        "q40":  float(np.percentile(valid, 40)),
+        "q50":  float(np.percentile(valid, 50)),
+        "q60":  float(np.percentile(valid, 60)),
+        "q75":  float(np.percentile(valid, 75)),
+        "q80":  float(np.percentile(valid, 80)),
+        "q90":  float(np.percentile(valid, 90)),
+        "q100": float(np.percentile(valid, 100)),
+    }
+
+
+def unique_value_counts(arr, max_unique_for_full=500):
+    valid = arr[~np.isnan(arr)]
+    if valid.size == 0:
+        return []
+
+    unique_vals, counts = np.unique(valid, return_counts=True)
+
+    if len(unique_vals) > max_unique_for_full:
+        return None
+
+    return [
+        (float(val), int(cnt))
+        for val, cnt in zip(unique_vals, counts)
+    ]
+
+
+def add_excel_header(ws, row_num, headers):
+    for col_num, h in enumerate(headers, start=1):
+        cell = ws.cell(row=row_num, column=col_num, value=h)
+        cell.font = Font(bold=True)
+
+
+# =========================================================
+# EXCEL REPORT GENERATION
+# =========================================================
+
+def generate_reclass_summary_excel(all_parameters, workspace, feedback):
+    """
+    Creates Excel workbook for reclassification review.
+    Generates summary statistics, quantile tables,
+    classification templates and flood risk scoring sheets.
+    """
+    summary_folder = ensure_folder(
+        os.path.join(workspace, "06_summary")
+    )
+    out_excel = os.path.join(summary_folder, "Reclass_Assessment.xlsx")
+
+    feedback.pushInfo("")
+    feedback.pushInfo("=" * 40)
+    feedback.pushInfo("STEP: GENERATE RECLASS SUMMARY EXCEL")
+    feedback.pushInfo("=" * 40)
+
+    rasters = {
+        "Elevation":            all_parameters["Elevation"],
+        "LULC":                 all_parameters["LULC"],
+        "Slope":                all_parameters["Slope"],
+        "Rainfall":             all_parameters["Rainfall"],
+        "FlowAccumulation":     all_parameters["FlowAccumulation"],
+        "DistanceToRiver":      all_parameters["DistanceToRiver"],
+        "DistanceToRoad":       all_parameters["DistanceToRoad"],
+        "DistanceToSettlement": all_parameters["DistanceToSettlement"],
+        "DistanceToLake":       all_parameters["DistanceToLake"],
+    }
+
+    wb            = Workbook()
+    default_sheet = wb.active
+    wb.remove(default_sheet)
+
+    # --- Summary Sheet ---
+    summary_ws = wb.create_sheet("Summary")
+    add_excel_header(summary_ws, 1, [
+        "Raster", "Path", "Valid_Count",
+        "Min", "Max", "Mean", "StdDev",
+        "Q10", "Q20", "Q25", "Q40",
+        "Q50", "Q60", "Q75", "Q80", "Q90"
+    ])
+
+    summary_row              = 2
+    continuous_for_quantiles = [
+        "Elevation", "Rainfall", "FlowAccumulation"
+    ]
+
+    for name, path in rasters.items():
+        if not os.path.exists(path):
+            feedback.pushInfo(f"{name} missing: {path}")
+            continue
+
+        feedback.pushInfo(f"Processing summary for: {name}")
+
+        arr, ds, nodata = read_raster_array(path)
+        stats           = raster_summary(arr)
+
+        if stats is None:
+            feedback.pushInfo(f"No valid cells in {name}")
+            continue
+
+        # --- Write Summary Row ---
+        summary_ws.cell(summary_row, 1,  name)
+        summary_ws.cell(summary_row, 2,  path)
+        summary_ws.cell(summary_row, 3,  stats["count_valid"])
+        summary_ws.cell(summary_row, 4,  stats["min"])
+        summary_ws.cell(summary_row, 5,  stats["max"])
+        summary_ws.cell(summary_row, 6,  stats["mean"])
+        summary_ws.cell(summary_row, 7,  stats["std"])
+        summary_ws.cell(summary_row, 8,  stats["q10"])
+        summary_ws.cell(summary_row, 9,  stats["q20"])
+        summary_ws.cell(summary_row, 10, stats["q25"])
+        summary_ws.cell(summary_row, 11, stats["q40"])
+        summary_ws.cell(summary_row, 12, stats["q50"])
+        summary_ws.cell(summary_row, 13, stats["q60"])
+        summary_ws.cell(summary_row, 14, stats["q75"])
+        summary_ws.cell(summary_row, 15, stats["q80"])
+        summary_ws.cell(summary_row, 16, stats["q90"])
+        summary_row += 1
+
+        # --- Quantile Sheets (Continuous Parameters) ---
+        if name in continuous_for_quantiles:
+            ws = wb.create_sheet(f"{name}_Quantiles")
+            add_excel_header(ws, 1, ["Metric", "Value"])
+
+            quantile_rows = [
+                ("Min", stats["min"]),  ("Q10", stats["q10"]),
+                ("Q20", stats["q20"]),  ("Q25", stats["q25"]),
+                ("Q40", stats["q40"]),  ("Q50", stats["q50"]),
+                ("Q60", stats["q60"]),  ("Q75", stats["q75"]),
+                ("Q80", stats["q80"]),  ("Q90", stats["q90"]),
+                ("Max", stats["max"]),
+            ]
+
+            r = 2
+            for metric, value in quantile_rows:
+                ws.cell(r, 1, metric)
+                ws.cell(r, 2, value)
+                r += 1
+
+            r += 1
+            add_excel_header(
+                ws, r,
+                ["Suggested_Class", "From", "To", "Risk_Score"]
+            )
+            r += 1
+
+            suggested = [
+                ("Class 1", stats["min"], stats["q20"], ""),
+                ("Class 2", stats["q20"], stats["q40"], ""),
+                ("Class 3", stats["q40"], stats["q60"], ""),
+                ("Class 4", stats["q60"], stats["q80"], ""),
+                ("Class 5", stats["q80"], stats["max"], ""),
+            ]
+            for row in suggested:
+                for c, val in enumerate(row, start=1):
+                    ws.cell(r, c, val)
+                r += 1
+
+            r += 1
+            if name == "Elevation":
+                ws.cell(r, 1, "Flood logic")
+                ws.cell(r, 2, "Lower elevation = higher risk")
+            elif name == "Rainfall":
+                ws.cell(r, 1, "Flood logic")
+                ws.cell(r, 2, "Higher rainfall = higher risk")
+            elif name == "FlowAccumulation":
+                ws.cell(r, 1, "Flood logic")
+                ws.cell(r, 2, "Higher flow accumulation = higher risk")
+
+        # --- LULC Categories Sheet ---
+        if name == "LULC":
+            ws = wb.create_sheet("LULC_Categories")
+            add_excel_header(ws, 1, [
+                "LULC_Value", "Pixel_Count",
+                "Class_Name", "Flood_Risk_Score_1_to_5"
+            ])
+
+            unique_counts = unique_value_counts(
+                arr, max_unique_for_full=1000
+            )
+
+            if unique_counts is None:
+                ws.cell(
+                    2, 1,
+                    "Too many unique values. "
+                    "Check whether raster is categorical."
+                )
+            else:
+                r = 2
+                for val, cnt in unique_counts:
+                    ws.cell(r, 1, val)
+                    ws.cell(r, 2, cnt)
+                    ws.cell(r, 3, "")
+                    ws.cell(r, 4, "")
+                    r += 1
+
+        # --- Slope Template ---
+        if name == "Slope":
+            ws = wb.create_sheet("Slope_Template")
+            add_excel_header(ws, 1, [
+                "From_Degree", "To_Degree",
+                "Risk_Score_1_to_5", "Reason"
+            ])
+            template = [
+                (0,   2,      "", "Very flat = more water stagnation"),
+                (2,   5,      "", "Low slope"),
+                (5,   10,     "", "Moderate slope"),
+                (10,  20,     "", "Steeper slope"),
+                (20,  999999, "", "Very steep = less flood stagnation"),
+            ]
+            r = 2
+            for row in template:
+                for c, val in enumerate(row, start=1):
+                    ws.cell(r, c, val)
+                r += 1
+
+        # --- Distance to River Template ---
+        if name == "DistanceToRiver":
+            ws = wb.create_sheet("DistRiver_Template")
+            add_excel_header(ws, 1, [
+                "From_Meter", "To_Meter",
+                "Risk_Score_1_to_5", "Reason"
+            ])
+            template = [
+                (0,    250,    "", "Closest to river = highest flood influence"),
+                (250,  500,    "", "Near river"),
+                (500,  1000,   "", "Moderate influence"),
+                (1000, 2000,   "", "Low influence"),
+                (2000, 999999, "", "Far from river = lowest influence"),
+            ]
+            r = 2
+            for row in template:
+                for c, val in enumerate(row, start=1):
+                    ws.cell(r, c, val)
+                r += 1
+
+        # --- Distance to Road Template ---
+        if name == "DistanceToRoad":
+            ws = wb.create_sheet("DistRoad_Template")
+            add_excel_header(ws, 1, [
+                "From_Meter", "To_Meter",
+                "Risk_Score_1_to_5", "Reason"
+            ])
+            template = [
+                (0,    100,    "", "Closest to road = high runoff & drainage obstruction"),
+                (100,  300,    "", "Near road"),
+                (300,  600,    "", "Moderate influence"),
+                (600,  1000,   "", "Low influence"),
+                (1000, 999999, "", "Far from road = lowest influence"),
+            ]
+            r = 2
+            for row in template:
+                for c, val in enumerate(row, start=1):
+                    ws.cell(r, c, val)
+                r += 1
+
+        # --- Distance to Settlement Template ---
+        if name == "DistanceToSettlement":
+            ws = wb.create_sheet("DistSettlement_Template")
+            add_excel_header(ws, 1, [
+                "From_Meter", "To_Meter",
+                "Risk_Score_1_to_5", "Reason"
+            ])
+            template = [
+                (0,    200,    "", "Closest to settlement = high impervious surface"),
+                (200,  500,    "", "Near settlement"),
+                (500,  1000,   "", "Moderate influence"),
+                (1000, 2000,   "", "Low influence"),
+                (2000, 999999, "", "Far from settlement = minimal flood influence"),
+            ]
+            r = 2
+            for row in template:
+                for c, val in enumerate(row, start=1):
+                    ws.cell(r, c, val)
+                r += 1
+
+        # --- Distance to Lake Template ---
+        if name == "DistanceToLake":
+            ws = wb.create_sheet("DistLake_Template")
+            add_excel_header(ws, 1, [
+                "From_Meter", "To_Meter",
+                "Risk_Score_1_to_5", "Reason"
+            ])
+            template = [
+                (0,    200,    "", "Very close to lake = highest flood risk (overflow zone)"),
+                (200,  500,    "", "Near lake"),
+                (500,  1000,   "", "Moderate flood influence"),
+                (1000, 2000,   "", "Low influence"),
+                (2000, 999999, "", "Far from lake = minimal flood risk"),
+            ]
+            r = 2
+            for row in template:
+                for c, val in enumerate(row, start=1):
+                    ws.cell(r, c, val)
+                r += 1
+
+    # --- Auto Column Width ---
+    for ws in wb.worksheets:
+        for col in ws.columns:
+            max_len    = 0
+            col_letter = col[0].column_letter
+            for cell in col:
+                try:
+                    val     = str(cell.value) if cell.value is not None else ""
+                    max_len = max(max_len, len(val))
+                except Exception:
+                    pass
+            ws.column_dimensions[col_letter].width = min(max_len + 2, 35)
+
+    wb.save(out_excel)
+    feedback.pushInfo(f"Excel created successfully: {out_excel}")
+
+    return {
+        "ReclassExcel":  out_excel,
+        "SummaryFolder": summary_folder
+    }
+
+
+# =========================================================
+# QGIS PROCESSING ALGORITHM CLASS
+# =========================================================
+
+class FloodPhase1Tool(QgsProcessingAlgorithm):
+
+    # --- Parameter Keys ---
+    DEM            = "DEM"
+    AOI            = "AOI"
+    RAINFALL       = "RAINFALL"
+    LULC           = "LULC"
+    RIVERS         = "RIVERS"
+    ROADS          = "ROADS"
+    SETTLEMENTS    = "SETTLEMENTS"
+    LAKES          = "LAKES"
+    OUTPUT         = "OUTPUT"
+    FLOW_THRESHOLD = "FLOW_THRESHOLD"
+    MEMORY         = "MEMORY"
+
+    def name(self):
+        return "flood_phase1"
+
+    def displayName(self):
+        return "Flood Estimation - Phase 1 (Preparation + Excel)"
+
+    def group(self):
+        return "Flood Tools"
+
+    def groupId(self):
+        return "flood_tools"
+
+    def shortHelpString(self):
+        return (
+            "Runs Phase 1 of the flood susceptibility estimation workflow.\n\n"
+            "Performs:\n"
+            "  1. Input validation and geometry checks\n"
+            "  2. Coordinate reprojection\n"
+            "  3. AOI-based clipping\n"
+            "  4. Model input raster preparation and grid alignment\n"
+            "  5. Terrain parameter derivation\n"
+            "     (Slope, Flow Accumulation, Flow Direction)\n"
+            "  6. Proximity parameter generation\n"
+            "     (Distance to River, Road, Settlement, Lake)\n"
+            "  7. Automated Excel reclassification report\n\n"
+            "Outputs all flood conditioning parameters as\n"
+            "analysis-ready raster layers."
+        )
+
+    def initAlgorithm(self, config=None):
+
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.DEM, "DEM Raster"
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterVectorLayer(
+                self.AOI, "AOI Boundary",
+                [QgsProcessing.TypeVectorPolygon]
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.RAINFALL, "Rainfall Raster"
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterRasterLayer(
+                self.LULC, "LULC Raster"
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterVectorLayer(
+                self.RIVERS, "River Layer",
+                [QgsProcessing.TypeVectorLine]
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterVectorLayer(
+                self.ROADS, "Road Layer",
+                [QgsProcessing.TypeVectorLine]
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterVectorLayer(
+                self.SETTLEMENTS, "Settlement Layer",
+                [QgsProcessing.TypeVectorPolygon]
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterVectorLayer(
+                self.LAKES, "Lake Layer",
+                [QgsProcessing.TypeVectorPoint]
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterFolderDestination(
+                self.OUTPUT, "Output Workspace Folder"
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.FLOW_THRESHOLD,
+                "Flow Accumulation Threshold",
+                type=QgsProcessingParameterNumber.Integer,
+                defaultValue=1000
+            )
+        )
+        self.addParameter(
+            QgsProcessingParameterNumber(
+                self.MEMORY,
+                "GRASS Memory (MB)",
+                type=QgsProcessingParameterNumber.Integer,
+                defaultValue=300
+            )
+        )
+
+    def processAlgorithm(self, parameters, context, feedback):
+
+        # --- Get Inputs ---
+        dem_layer        = self.parameterAsRasterLayer(
+            parameters, self.DEM,         context)
+        aoi_layer        = self.parameterAsVectorLayer(
+            parameters, self.AOI,         context)
+        rainfall_layer   = self.parameterAsRasterLayer(
+            parameters, self.RAINFALL,    context)
+        lulc_layer       = self.parameterAsRasterLayer(
+            parameters, self.LULC,        context)
+        river_layer      = self.parameterAsVectorLayer(
+            parameters, self.RIVERS,      context)
+        road_layer       = self.parameterAsVectorLayer(
+            parameters, self.ROADS,       context)
+        settlement_layer = self.parameterAsVectorLayer(
+            parameters, self.SETTLEMENTS, context)
+        lake_layer       = self.parameterAsVectorLayer(
+            parameters, self.LAKES,       context)
+        workspace        = self.parameterAsString(
+            parameters, self.OUTPUT,      context)
+        flow_threshold   = self.parameterAsInt(
+            parameters, self.FLOW_THRESHOLD, context)
+        memory           = self.parameterAsInt(
+            parameters, self.MEMORY,      context)
+
+        target_crs = QgsCoordinateReferenceSystem("EPSG:32643")
+
+        # --- Create Workspace ---
+        if not os.path.exists(workspace):
+            os.makedirs(workspace)
+
+        feedback.pushInfo("=" * 40)
+        feedback.pushInfo("FLOOD PHASE 1 — STARTING PROCESSING")
+        feedback.pushInfo("=" * 40)
+
+        # --- Stage 1: Validation ---
+        validated = validate_inputs(
+            dem_layer, aoi_layer, rainfall_layer, lulc_layer,
+            river_layer, road_layer, settlement_layer, lake_layer,
+            feedback
+        )
+
+        # --- Stage 2: Reprojection ---
+        reproj = reproject_inputs(
+            validated, target_crs, workspace, feedback
+        )
+
+        # --- Stage 3: Clipping ---
+        clipped = clip_inputs_to_aoi(reproj, workspace, feedback)
+
+        # --- Stage 4: Model Input Preparation ---
+        model_inputs = prepare_model_input_rasters(
+            clipped, workspace, feedback
+        )
+
+        # --- Stage 5: Terrain Parameters ---
+        terrain = prepare_terrain_parameters(
+            model_inputs, workspace, flow_threshold, memory, feedback
+        )
+
+        # --- Stage 6: Proximity Parameters ---
+        # Each function chains output of previous as input
+        river_params      = prepare_river_distance_parameter(
+            terrain,       workspace, feedback
+        )
+        road_params       = prepare_road_distance_parameter(
+            river_params,  workspace, feedback
+        )
+        settlement_params = prepare_settlement_distance_parameter(
+            road_params,   workspace, feedback
+        )
+        all_params        = prepare_lake_distance_parameter(
+            settlement_params, workspace, feedback
+        )
+
+        # --- Stage 7: Excel Report ---
+        summary = generate_reclass_summary_excel(
+            all_params, workspace, feedback
+        )
+
+        feedback.pushInfo("")
+        feedback.pushInfo("=" * 40)
+        feedback.pushInfo("FLOOD PHASE 1 COMPLETED SUCCESSFULLY!")
+        feedback.pushInfo("=" * 40)
+        feedback.pushInfo(f"Excel Report : {summary['ReclassExcel']}")
+        feedback.pushInfo(f"Workspace    : {workspace}")
+
+        return {
+            "Excel_Output": summary["ReclassExcel"]
+        }
+
+    def createInstance(self):
+        return FloodPhase1Tool()
